@@ -1,0 +1,285 @@
+# Configuration de l'étape 01 — préparation des entrées (notebook 01_prepare_inputs).
+#
+# Ne contient que les clés lues par l'étape 01. Les étapes suivantes (21 à 44)
+# ajouteront leurs propres sections.
+#
+# Tous les chemins sont relatifs à la racine du projet.
+# La cellule « Paramètres » du notebook surcharge les chemins, la source de
+# données, les filtres et le plan de traitement : ce fichier fixe surtout les
+# seuils de nettoyage, de segmentation et de validation.
+#
+# Source de travail : Panel Lémanique 2023 (pl23) — conversion Parquet,
+# traitement par tranches, correspondance user_id_fors -> user_id_motiontag.
+# Déclic (declic) reste disponible en rétrocompatibilité depuis le notebook :
+# lecture CSV directe, sans conversion ni correspondance d'identifiants.
+#
+# Seuils de nettoyage, segmentation et validation repris de l'ancien full_waypoints.yaml.
+
+paths:
+  output_dir: outputs/pl23                                                  # surchargé par le notebook (un dossier par jeu)
+  waypoint_glob: Data/GPS/pl23/waypoints/*.csv                              # surchargé par le notebook
+  waypoint_parquet_dir: Data/GPS/pl23/waypoints-parquet                     # surchargé par le notebook
+  legs_file: Data/GPS/pl23/20241120_dump_situee/241120_legs_nogeom.csv      # surchargé par le notebook
+  # storyline_file: Data/GPS/declic/storyline.csv  # seulement si leg_matching.source = storyline_csv
+
+# --------------------------------------------------------------------------- #
+# Waypoints bruts
+# --------------------------------------------------------------------------- #
+raw_waypoints:
+  source: parquet        # parquet (pl23 : dataset partitionné, par tranches) | csv (declic : tout en mémoire) — fixé par le notebook
+  delimiter: auto        # auto = détecté sur l'en-tête de chaque CSV ; sinon ",", ";" ou "\t"
+  user_col: user_id
+  time_col: tracked_at
+  lat_col: latitude
+  lon_col: longitude
+  speed_col: speed
+  accuracy_col: accuracy
+  speed_unit: mps        # mps | kmh — Motiontag exporte la vitesse en m/s
+
+# Conversion CSV → Parquet (waypoint_parquet.py)
+parquet_conversion:
+  n_partitions: 64       # fixé à la conversion ; le changer impose de reconvertir
+  compression: zstd
+  keep_fragments: true   # garder les fragments par CSV : ajout de nouveaux CSV sans tout relire
+  # text_columns: [user_id, tracked_at]   # par défaut : user_col + time_col ; tout le reste en float64
+
+# --------------------------------------------------------------------------- #
+# Nettoyage GPS (clean_waypoints)
+# --------------------------------------------------------------------------- #
+cleaning:
+  max_accuracy_m: 10          # remplacé par leg_filters.max_accuracy_m s'il est défini
+  drop_duplicate_points: true  # même utilisateur, même timestamp, mêmes coordonnées
+  unknown_speed_values: [-1]   # valeurs de vitesse « inconnue » remplacées par la vitesse calculée
+  max_speed_kmh: 180           # vitesses plafonnées à cette valeur
+
+# --------------------------------------------------------------------------- #
+# Appariement waypoint ↔ leg (read_transport_legs, attach_waypoints_to_legs)
+# --------------------------------------------------------------------------- #
+leg_matching:
+  # pl23_legs_parquet   : dump Situee / Panel Lémanique (CSV ou Parquet), colonnes préréglées dans le code
+  #                       (user_id_fors, leg_id, started_at, finished_at, mode, detected_mode, type=Track)
+  # declic_legs_parquet : rétrocompatibilité Déclic, colonnes ci-dessous
+  # declic_legs_export  : export Déclic avec géométrie, colonnes préréglées dans le code
+  # storyline_csv       : export storyline (paths.storyline_file)
+  source: pl23_legs_parquet     # surchargé par le notebook
+  # Colonnes de legs.parquet pour la source declic_legs_parquet (ignorées pour pl23).
+  user_col: user_id
+  type_col: type
+  track_value: Track
+  start_col: started_at
+  finish_col: finished_at
+  leg_id_col: leg_id
+  mode_col: mode
+  detected_mode_col: detected_mode
+  storyline_id_col: storyline_id
+  trip_id_col: trip_id
+  mode_niv1_col: mode_niv1
+  mode_niv2_col: mode_niv2
+  mode_mrmt_col: mode_mrmt
+  car_modes: [Mode::Car, Mode::Ecar]   # surchargé par le notebook
+  write_assignment_table: true         # écrit waypoint_leg_assignments.parquet (volumineux)
+  # Correspondance d'identifiants (pl23) : surchargée par le notebook ; null pour declic
+  user_id_map:
+    file: Data/GPS/pl23/20241120_dump_situee/241120_user_statistics_nogeom.csv
+    legs_id_col: user_id_fors           # identifiant des legs
+    waypoints_id_col: user_id_motiontag # identifiant des waypoints
+
+# --------------------------------------------------------------------------- #
+# Enrichissement des legs (leg_enrichment.py) — pl23 ; désactivé pour declic
+# --------------------------------------------------------------------------- #
+leg_enrichment:
+  enabled: true                       # surchargé par le notebook (DATASETS[...]["leg_enrichment"])
+  map_track_trip_file: Data/GPS/pl23/20241120_dump_situee/241120_map_track_trip_journey.csv   # leg_id -> trip_id, journey_id
+  trips_file: Data/GPS/pl23/20241120_dump_situee/241120_trips.csv                             # motif, durée, distance, leading_activity_id
+  drop_legs_without_trip: true        # legs absentes de la table de correspondance retirées (comme l'étape 23)
+  local_timezone: Europe/Zurich       # tranche horaire et jour ; "UTC" pour reproduire l'étape 23
+  add_survey: true                    # space_home, space_work, zones, KLASSE_ARE_dom, âge, genre, Weight (pl23_survey.survey_file)
+  post_car_walk:
+    enabled: true
+    walk_modes: [Mode::Walk]
+    max_gap_minutes: 15               # écart max entre fin de la voiture et début de la marche
+    max_walk_distance_m: 2000         # longueur max de la marche retenue
+    write_waypoints: true             # écrit waypoints_post_car_walk.parquet (traces de la marche)
+
+# --------------------------------------------------------------------------- #
+# Corpus commun de legs (leg_corpus.py) — construit à l'étape 01, utilisé tel quel
+# par la méthode temporelle (étape 32) ET la méthode spatiale (étape 22).
+# null = filtre désactivé. Effet de chaque filtre : notebook 21 (EDA).
+# --------------------------------------------------------------------------- #
+leg_filters:
+  max_accuracy_m: 10                    # waypoints plus imprécis retirés au nettoyage (avant tout le reste)
+  min_leg_points: 20                     # waypoints voiture minimum par leg
+  min_leg_duration_s: 300                # durée minimale (premier → dernier waypoint)
+  min_leg_length_m: 500                  # distance parcourue minimale (somme des pas entre waypoints)
+  min_origin_destination_distance_m: 100 # début et fin plus proches → écarté (boucle, aller-retour)
+  max_window_gap_s: 120                  # trou maximal entre waypoints dans le cercle de destination
+  max_trip_duration_s: 18000             # durée maximale du trip (5 h)
+  destination_window_radius_m: 1000      # rayon du cercle de destination (aussi celui de la méthode spatiale)
+  exclude_tunnel_h3_destinations: true   # destination dans une cellule H3 de tunnel (perte de signal)
+  tunnel_h3_resolution: 8
+  tunnel_h3_cells: ["881f91ad29fffff", "881f91ad07fffff", "881f91af19fffff", "881f91af25fffff", "881f91a893fffff", "881f91ad2bfffff", "881f91ad01fffff", "881f91ad03fffff", "881f91ad67fffff", "881f91af2dfffff", "881f91af11fffff"]
+
+# --------------------------------------------------------------------------- #
+# Segmentation des traces voiture (segment_waypoints, loop_segments.py)
+# --------------------------------------------------------------------------- #
+segmentation:
+  gap_minutes: 15              # un trou plus long coupe la trace en deux segments
+  min_points: 20               # segments retenus : bornes sur points, durée et distance
+  max_points_per_segment: 10000
+  min_duration_minutes: 1
+  max_duration_minutes: 180
+  min_distance_m: 100
+  trim_static_tail: true       # coupe la fin de trace immobile (voiture garée)
+  static_speed_kmh: 2          # vitesse sous laquelle un point est « immobile »
+  static_tail_minutes: 5       # durée minimale de la queue immobile pour la couper
+  loop_radius_m: 100           # surchargé par le notebook
+  apply_loop_filter: false     # surchargé par le notebook ; false = boucles filtrées à l'étape 32 (temporal_detection.loop_radius_m)
+
+# --------------------------------------------------------------------------- #
+# Validation des segments pour le modèle ReLUT (validation.py)
+# --------------------------------------------------------------------------- #
+relut_validation:
+  min_rows: 2
+  max_rows: 10000
+  max_duration_days: 30
+  max_median_interval_seconds: 20
+  max_timestamp_gap_seconds: 3600
+
+# --------------------------------------------------------------------------- #
+# Filtre de périmètre sur la destination des legs voiture (spatial_study_area.py)
+# --------------------------------------------------------------------------- #
+spatial_detection:
+  destination_boundary_file: Data/GIS/AGGLO_PERIMETRE_AVEC_LAC.gpkg   # surchargé par le notebook
+  destination_boundary_layer: agglo_perimetre_avec_lac               # surchargé par le notebook
+  apply_study_area_filter: true                                      # surchargé par le notebook
+  destination_source_crs: EPSG:4326
+
+# --------------------------------------------------------------------------- #
+# Limites et plan de traitement (surchargés par le notebook)
+# --------------------------------------------------------------------------- #
+run:
+  max_files: null        # declic (csv) uniquement
+  max_users: null        # declic (csv) uniquement
+  max_segments: null     # declic (csv) uniquement
+  max_partitions: null   # pl23 (parquet) : nombre de partitions traitées (run réduit)
+  groups_per_run: 4      # pl23 (parquet) : partitions par tranche (RAM)
+  force_rerun: false     # pl23 (parquet) : recalcule les tranches déjà terminées
+
+# --------------------------------------------------------------------------- #
+# Questionnaire PL23 (étape 21 : space_home / space_work)
+# --------------------------------------------------------------------------- #
+pl23_survey:
+  survey_file: Data/GPS/pl23/EPFL_vague1_v4.csv   # clé de jointure IDNO = user_id_fors
+
+# --------------------------------------------------------------------------- #
+# Étape 32 — détection temporelle ReLUT (relut_detection.py)
+# --------------------------------------------------------------------------- #
+model:
+  path: models/ParkingSearchPrediction.h5   # poids lus avec h5py, réseau évalué en numpy (pas de TensorFlow)
+  p_search: auto                             # auto = seuils ReLUT selon l'échantillonnage du trajet ; ou une valeur 0–1
+  max_search_duration_minutes: 15            # recherche plafonnée aux 15 dernières minutes du segment
+
+temporal_detection:
+  max_legs: null              # null = toutes les legs ; ex. 300 pour un run limité (tirage aléatoire)
+  random_seed: 42             # tirage des legs et des échantillons cartographiés
+  chunk_segments: 2000        # segments traités par paquet (mémoire)
+  use_survey: true            # joindre space_home / space_work (pl23)
+  parking_variable: space_home   # space_home ou space_work : variable qui définit les groupes
+  no_cruise_categories: ["Pas de place dédiée, pas besoin de cruise"]
+  cruise_categories: ["Pas de place dédiée, besoin de cruise"]
+  n_longest_map: 20           # carte des N recherches prédites les plus longues
+  n_sample_map: 20            # taille des échantillons « besoin » / « pas besoin »
+  n_generic_sample: 12        # courbes de probabilité + carte « generic sample » (tirage aléatoire)
+  write_leg_table: true       # écrit legs/relut_by_leg.parquet (run limité : legs/_samples/<run_id>/)
+
+# --------------------------------------------------------------------------- #
+# Étape 41 — indicateurs de cruising par heure et par motif (indicators.py)
+# --------------------------------------------------------------------------- #
+indicators:
+  methods: [relut]              # relut, spatial, hybrid : tables legs/<méthode>_by_leg.parquet (absentes = ignorées)
+  layout: panels                # panels (une figure par méthode, côte à côte) ou overlay (superposées, légende)
+  min_legs_per_class: 10        # classes avec moins de legs non tracées (gardées dans les tableaux)
+  purpose_column: purpose_agg   # purpose_agg (motifs regroupés) ou trip_purpose (motif détaillé)
+  min_cruising_duration_s: 0    # une leg compte « avec cruising » si durée ≥ seuil (0 = toute détection)
+  show_reference: true          # répartitions : référence grise = toutes les legs évaluées
+  local_timezone: Europe/Zurich # heure de fin de leg ; classe 9 h = 8:30:00–9:29:59
+  sample_run_id: null           # lire les tables d'un run limité (legs/_samples/<run_id>)
+
+# --------------------------------------------------------------------------- #
+# Étape 41 (section H3) — indicateurs par hexagone et carte HTML (h3_indicators.py)
+# --------------------------------------------------------------------------- #
+h3_indicators:
+  resolution: 8                 # ~0,7 km² par hexagone
+  min_persons: 3                # valeur publiée seulement si ≥ 3 personnes distinctes contribuent…
+  min_legs: 3                   # … et ≥ 3 legs (stabilité et confidentialité)
+  max_point_interval_s: 120     # temps attribué à un point = intervalle jusqu'au suivant, plafonné
+  parking_supply_file: Data/GIS/OTC_PARKING.gpkg   # offre de stationnement (null pour ignorer)
+  parking_supply_layer: otc_parking
+  parking_capacity_column: nb_pl_publiques
+  parking_name_column: nom
+
+# --------------------------------------------------------------------------- #
+# Étape 22 — détection spatiale sur les waypoints (spatial_waypoints.py)
+# --------------------------------------------------------------------------- #
+spatial_waypoints:
+  buffer_radius_m: 1000              # remplacé par leg_filters.destination_window_radius_m
+  staypoints_file: Data/GPS/pl23/20241120_dump_situee/241120_staypoints.geojson   # activité de destination (null : référence = destination)
+  # Règles propres à la méthode spatiale, EN PLUS du corpus commun (leg_filters).
+  # Désactivées par défaut : la méthode spatiale traite exactement le corpus commun.
+  require_last_car_leg_in_trip: false
+  allowed_post_car_modes: [Mode::Walk]
+  exclude_non_allowed_post_car_modes: false
+  min_speed_kmh: null
+  max_speed_kmh: null
+  max_parking_activity_distance_m: null
+  require_activity_location: false
+  min_window_points: null
+  exclude_starts_in_buffer: false
+  h3_resolution: 8
+  # Métriques
+  min_step_m: 10                     # anti-bruit GPS : waypoint ignoré s'il est à < 10 m du précédent retenu
+  loop_radius_m: 30                  # boucle : repassage à moins de X m…
+  loop_min_delay_s: 60               # … d'un point visité au moins Y s plus tôt…
+  loop_min_excursion_m: 100          # … après s'en être éloigné d'au moins Z m
+  near_reference_radius_m: 25        # passage à moins de x m de la référence…
+  near_reference_exclusion_end_m: 150   # … hors des 150 derniers mètres de trace
+  reference_point: activity          # activity (repli sur la destination) ou destination
+  # Détection (critères combinés par « ou » ; null = critère désactivé)
+  detect_loop: true
+  detect_passes_near_reference: true
+  detect_backtrack_min_m: 200
+  detect_window_distance_min_m: null
+  detect_dist_excess_min_m: 200      # utilisé seulement si legs/routing_by_leg.parquet existe
+  detect_dist_excess_matched_min_m: null   # détour sur trace appariée (map matching) ; null = critère désactivé
+  search_measure: excess_if_available   # ou window
+  routing_requests_scope: eligible   # eligible ou all_with_window
+  routing_request_types: [raw_od, matched_od]   # raw_od : entrée interpolée → dernier waypoint ; matched_od : positions recalées par /match
+  matched_od_single_matching_only: true          # OD corrigée seulement si l'appariement est d'un seul tenant
+  routing_reference: raw_od                      # plus court chemin utilisé pour les distances excessives (raw_od ou matched_od)
+
+# --------------------------------------------------------------------------- #
+# Étape 27 — routage des demandes de l'étape 22 (routing_xyt.py, service xyt_routing local)
+# --------------------------------------------------------------------------- #
+routing:
+  base_url: http://127.0.0.1:8010    # API xyt-routing-api
+  mode: car_ch_extended_200km        # alias du graphe dans configs/service.ch_extended_200km.yaml
+  weighting: distance                # plus court chemin
+  batch_size: 500
+  timeout_seconds: 120
+  include_geometry: true             # géométries routées → data/routing_geometries.parquet
+  max_routes: null                   # ex. 200 pour un essai
+  force_reroute: false               # true : ignorer le cache
+  comparison_map_legs: 30
+
+# --------------------------------------------------------------------------- #
+# Map matching des fenêtres de destination (map_matching.py, conteneur OSRM /match)
+# --------------------------------------------------------------------------- #
+map_matching:
+  osrm_url: http://127.0.0.1:5001    # port du conteneur OSRM (docker compose ps), pas l'API xyt (8010)
+  profile: driving
+  max_points: 100                    # limite par défaut d'OSRM par requête
+  radius_min_m: 5                    # rayon de recherche = précision GPS bornée
+  radius_max_m: 50
+  entry_radius_m: 50                 # point d'entrée interpolé
+  timeout_seconds: 30
+

@@ -21,6 +21,7 @@ la mémoire ne dépend pas du nombre total de segments.
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import time
 from datetime import datetime
@@ -209,6 +210,45 @@ def summarize_segments(predictions: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 
 
+def _as_purpose_list(purposes: Any) -> list[str] | None:
+    """``None`` / liste vide = tous les motifs ; une chaîne seule est acceptée."""
+    if purposes is None:
+        return None
+    if isinstance(purposes, str):
+        purposes = [purposes]
+    purposes = [str(p) for p in purposes]
+    return purposes or None
+
+
+def purpose_suffix(purposes: list[str] | None) -> str:
+    """Suffixe de nom de fichier / run_id, ex. ``_motifs-Travail+Loisirs`` (vide si tous les motifs)."""
+    if not purposes:
+        return ""
+    clean = [re.sub(r"[^0-9A-Za-zÀ-ÿ]+", "-", p).strip("-") for p in purposes]
+    return "_motifs-" + "+".join(clean)
+
+
+def legs_with_purposes(config: dict[str, Any], purposes: list[str] | None, purpose_column: str = "purpose_agg") -> set[str] | None:
+    """Legs dont le motif (``purpose_column`` de ``legs_enriched``) est dans ``purposes``.
+
+    ``None`` si ``purposes`` est vide (pas de sélection). Les valeurs inconnues sont signalées.
+    """
+    purposes = _as_purpose_list(purposes)
+    if purposes is None:
+        return None
+    from .leg_collection import table_path
+
+    path = table_path(config, "legs_enriched")
+    if not path.exists():
+        raise FileNotFoundError(f"sélection par motif impossible : {path} absente (étape 01, enrichissement des legs)")
+    legs = pd.read_parquet(path, columns=["leg_id", purpose_column])
+    available = set(legs[purpose_column].dropna().astype(str))
+    unknown = [p for p in purposes if p not in available]
+    if unknown:
+        print(f"[motifs] valeurs absentes de {purpose_column} : {unknown} — disponibles : {sorted(available)}", flush=True)
+    return set(legs.loc[legs[purpose_column].astype("string").isin(purposes), "leg_id"])
+
+
 def select_segments(points: pd.DataFrame, max_legs: int | None, random_seed: int = 42) -> pd.DataFrame:
     """Tous les segments, ou ceux de ``max_legs`` legs tirées au hasard (graine fixe)."""
     if max_legs is None:
@@ -248,6 +288,8 @@ def _settings(config: dict[str, Any]) -> dict[str, Any]:
         "n_sample_map": int(cfg.get("n_sample_map", 20)),
         "n_generic_sample": int(cfg.get("n_generic_sample", 12)),
         "write_leg_table": bool(cfg.get("write_leg_table", True)),
+        "purposes": _as_purpose_list(cfg.get("purposes")),
+        "purpose_column": cfg.get("purpose_column", "purpose_agg"),
     }
 
 
@@ -545,6 +587,7 @@ def build_relut_by_leg(
     sampled_legs: set[str] | None,
     settings: dict[str, Any],
     run_id: str,
+    purpose_legs: set[str] | None = None,
 ) -> pd.DataFrame:
     """Une ligne par leg (toutes les legs) : statut ReLUT et résultats du **dernier** segment.
 
@@ -619,6 +662,8 @@ def build_relut_by_leg(
     status[status.isna() & table["relut_segment_id"].isna()] = "no_segment"
     status[status.isna() & table["relut_segment_kept"].eq(False).fillna(False)] = "last_segment_rejected"
     status[status.isna() & ~table["relut_segment_id"].isin(prepared)] = "last_segment_loop"   # boucles retirées à l'étape 01
+    if purpose_legs is not None:
+        status[status.isna() & ~table["leg_id"].isin(purpose_legs)] = "other_purpose"
     if sampled_legs is not None:
         status[status.isna() & ~table["leg_id"].isin(sampled_legs)] = "not_sampled"
     predicted = summary.set_index("trip_candidate_id")
@@ -677,6 +722,13 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
     points = points[points["leg_id"].isin(corpus_ids)]
     print(f"[relut] corpus commun : {len(corpus_ids)} legs — {points['trip_candidate_id'].nunique()} segments "
           f"sur {segments_before_corpus} préparés", flush=True)
+    # Sélection par motif (optionnelle) : legs du corpus dont le motif est retenu
+    purpose_legs = legs_with_purposes(config, settings["purposes"], settings["purpose_column"])
+    if purpose_legs is not None:
+        before = int(points["leg_id"].nunique())
+        points = points[points["leg_id"].isin(purpose_legs)]
+        print(f"[relut] motifs {settings['purposes']} ({settings['purpose_column']}) : "
+              f"{points['leg_id'].nunique()} legs sur {before} du corpus", flush=True)
     all_segments = int(points["trip_candidate_id"].nunique())
     legs_available = int(points["leg_id"].nunique()) if "leg_id" in points else None
     points = select_segments(points, settings["max_legs"], settings["random_seed"])
@@ -689,6 +741,10 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
     segment_ids = np.sort(points["trip_candidate_id"].unique())
     n_legs = int(points["leg_id"].nunique()) if "leg_id" in points else None
     scope = "toutes les legs" if settings["max_legs"] is None else f"{settings['max_legs']} legs tirées au hasard (graine {settings['random_seed']})"
+    if purpose_legs is not None:
+        scope += f", motifs {', '.join(settings['purposes'])} ({settings['purpose_column']})"
+    # Un run limité aux motifs choisis ne remplace pas la table complète : il va dans legs/_samples/<run_id>
+    partial_run = is_sample or purpose_legs is not None
     fmt = lambda n: f"{n:,}".replace(",", "'")  # noqa: E731
     print(f"[relut] {fmt(len(segment_ids))} segments sur {fmt(all_segments)} ({scope}) — {fmt(len(points))} points", flush=True)
 
@@ -811,11 +867,12 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
         from .leg_collection import write_leg_table, write_persons_table
 
         run_id = datetime.now().strftime("%Y%m%dT%H%M%S") + (
-            f"_{settings['max_legs']}legs_seed{settings['random_seed']}" if is_sample else "_all"
-        )
-        relut_by_leg = build_relut_by_leg(config, summary, sampled_legs=sampled_legs, settings=settings, run_id=run_id)
+            f"_{settings['max_legs']}legs_seed{settings['random_seed']}" if is_sample else ("" if purpose_legs is not None else "_all")
+        ) + purpose_suffix(settings["purposes"] if purpose_legs is not None else None)
+        relut_by_leg = build_relut_by_leg(config, summary, sampled_legs=sampled_legs, settings=settings, run_id=run_id,
+                                          purpose_legs=purpose_legs)
         leg_table_path = write_leg_table(
-            relut_by_leg, config, "relut_by_leg", run_id=run_id, sample=is_sample,
+            relut_by_leg, config, "relut_by_leg", run_id=run_id, sample=partial_run,
             params={
                 "p_search": settings["p_search"],
                 "max_search_duration_minutes": settings["max_search_duration_minutes"],
@@ -824,13 +881,15 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
                 "random_seed": settings["random_seed"],
                 "model_path": str(settings["model_path"]),
                 "segment_rule": "dernier segment de la leg, sans repli",
+                "purposes": settings["purposes"],
+                "purpose_column": settings["purpose_column"],
             },
         )
         write_persons_table(config)
         leg_table_info = {
             "path": str(leg_table_path),
             "run_id": run_id,
-            "sample": is_sample,
+            "sample": partial_run,
             "status_counts": {k: int(v) for k, v in relut_by_leg["relut_status"].value_counts().items()},
         }
         print(f"[relut] table par leg : {leg_table_path} — {leg_table_info['status_counts']}", flush=True)
@@ -850,6 +909,8 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
                   "max_search_duration_minutes": settings["max_search_duration_minutes"]},
         "loop_filter": loop_info,
         "relut_by_leg": leg_table_info,
+        "purposes": settings["purposes"],
+        "purpose_column": settings["purpose_column"],
         "parking_variable": settings["parking_variable"] if parking_available else None,
         "parking_groups": settings["groups"] if parking_available else None,
         "seconds": round(time.perf_counter() - started, 1),
@@ -875,7 +936,7 @@ def run_temporal_detection(config: dict[str, Any]) -> dict[str, Any]:
 
 def threshold_share_table(
     config: dict[str, Any], variable: str, measure: str, thresholds: list[float], *,
-    sample_run_id: str | None = None,
+    sample_run_id: str | None = None, purposes: list[str] | str | None = None, purpose_column: str = "purpose_agg",
 ) -> pd.DataFrame:
     """Part des legs évaluées (ReLUT) dont la durée ou la distance de recherche dépasse chaque seuil.
 
@@ -883,16 +944,20 @@ def threshold_share_table(
     secondes) ou ``distance`` (seuils en mètres). Une ligne par catégorie (plus
     « Ensemble »), une colonne par seuil (« > seuil », strictement), plus ``n_legs``.
     Population : legs dont le dernier segment est prédit (``relut_status == "evaluated"``),
-    une leg sans recherche comptant pour 0.
+    une leg sans recherche comptant pour 0. ``purposes`` (ex. ``["Travail"]``) restreint aux
+    legs de ces motifs (colonne ``purpose_column``) ; ``None`` = tous les motifs.
     """
     from .leg_collection import load_leg_table
 
     column = {"duration": "relut_search_duration_s", "distance": "relut_search_distance_m"}[measure]
     unit = "s" if measure == "duration" else "m"
+    purposes = _as_purpose_list(purposes)
     legs = load_leg_table(config, ["relut_by_leg"], columns={
-        "legs_enriched": ["leg_id", variable], "relut_by_leg": ["relut_status", column],
+        "legs_enriched": list(dict.fromkeys(["leg_id", variable, purpose_column])), "relut_by_leg": ["relut_status", column],
     }, sample_run_id=sample_run_id, verbose=False)
-    legs = legs[legs["relut_status"].eq("evaluated")]
+    legs = legs[legs["relut_status"].eq("evaluated")].copy()
+    if purposes is not None:
+        legs = legs[legs[purpose_column].astype("string").isin(purposes)]
     legs[variable] = legs[variable].astype("string").fillna("non renseigné")
     groups = [("Ensemble", legs)] + [(str(value), legs[legs[variable].eq(value)])
                                      for value in legs[variable].value_counts().index]
@@ -903,7 +968,7 @@ def threshold_share_table(
             row[f"> {threshold:g} {unit}"] = float((sub[column] > threshold).mean()) if len(sub) else np.nan
         rows.append(row)
     table = pd.DataFrame(rows)
-    table.to_csv(output_path(config, "reports", f"32_part_au_dela_seuils_{measure}_{variable}.csv"), index=False)
+    table.to_csv(output_path(config, "reports", f"32_part_au_dela_seuils_{measure}_{variable}{purpose_suffix(purposes)}.csv"), index=False)
     return table
 
 
@@ -913,7 +978,8 @@ def threshold_share_table(
 
 
 def share_above_thresholds(
-    config: dict[str, Any], variable: str, quantity: str, thresholds: list[float], *, sample_run_id: str | None = None
+    config: dict[str, Any], variable: str, quantity: str, thresholds: list[float], *, sample_run_id: str | None = None,
+    purposes: list[str] | str | None = None, purpose_column: str = "purpose_agg",
 ) -> pd.DataFrame:
     """Part des legs évaluées dont la durée (``quantity="duration"``, seuils en minutes) ou la
     distance (``"distance"``, seuils en mètres) de recherche prédite atteint chaque seuil,
@@ -921,6 +987,7 @@ def share_above_thresholds(
 
     Une ligne par catégorie (plus « toutes les legs »), une colonne par seuil.
     Population : legs du corpus évaluées par ReLUT (sans recherche = 0). Comptage par leg, non pondéré.
+    ``purposes`` (ex. ``["Travail"]``) restreint aux legs de ces motifs (``purpose_column``).
     """
     from .leg_collection import load_leg_table
 
@@ -928,10 +995,13 @@ def share_above_thresholds(
         "duration": ("relut_search_duration_s", 1 / 60, "min"),
         "distance": ("relut_search_distance_m", 1.0, "m"),
     }[quantity]
+    purposes = _as_purpose_list(purposes)
     legs = load_leg_table(config, ["relut_by_leg"], columns={
-        "legs_enriched": ["leg_id", variable], "relut_by_leg": ["relut_status", column]},
+        "legs_enriched": list(dict.fromkeys(["leg_id", variable, purpose_column])), "relut_by_leg": ["relut_status", column]},
         sample_run_id=sample_run_id, verbose=False)
     legs = legs[legs["relut_status"].eq("evaluated")].copy()
+    if purposes is not None:
+        legs = legs[legs[purpose_column].astype("string").isin(purposes)]
     legs["valeur"] = legs[column] * scale
     legs[variable] = legs[variable].astype("string").fillna("non renseigné")
     groups = [("toutes les legs", legs)] + [(str(k), g) for k, g in legs.groupby(variable, sort=True)]
@@ -942,6 +1012,6 @@ def share_above_thresholds(
             row[f"≥ {threshold:g} {unit}"] = float(group["valeur"].ge(threshold).mean()) if len(group) else np.nan
         rows.append(row)
     table = pd.DataFrame(rows)
-    path = output_path(config, "reports", f"32_part_legs_{quantity}_par_{variable}.csv")
+    path = output_path(config, "reports", f"32_part_legs_{quantity}_par_{variable}{purpose_suffix(purposes)}.csv")
     table.to_csv(path, index=False)
     return table
